@@ -1,4 +1,5 @@
 # coding=utf-8
+from collections import namedtuple
 import datetime
 from decimal import Decimal
 from keyword import kwlist
@@ -20,7 +21,7 @@ from exchangelib.configuration import Configuration
 from exchangelib.credentials import DELEGATE, Credentials
 from exchangelib.errors import RelativeRedirect, ErrorItemNotFound, ErrorInvalidOperation, AutoDiscoverRedirect, \
     AutoDiscoverCircularRedirect, AutoDiscoverFailed, ErrorNonExistentMailbox, UnknownTimeZone, \
-    ErrorNameResolutionNoResults
+    ErrorNameResolutionNoResults, TransportError, RedirectError, CASError, RateLimitError
 from exchangelib.ewsdatetime import EWSDateTime, EWSDate, EWSTimeZone, UTC, UTC_NOW
 from exchangelib.folders import CalendarItem, Attendee, Mailbox, Message, ExtendedProperty, Choice, Email, Contact, \
     Task, EmailAddress, PhysicalAddress, PhoneNumber, IndexedField, RoomList, Calendar, DeletedItems, Drafts, Inbox, \
@@ -30,11 +31,15 @@ from exchangelib.queryset import QuerySet, DoesNotExist, MultipleObjectsReturned
 from exchangelib.restriction import Restriction, Q
 from exchangelib.services import GetServerTimeZones, GetRoomLists, GetRooms, GetAttachment, TNS
 from exchangelib.transport import NTLM
-from exchangelib.util import xml_to_str, chunkify, peek, get_redirect_url, isanysubclass, to_xml, BOM, get_domain
+from exchangelib.util import xml_to_str, chunkify, peek, get_redirect_url, isanysubclass, to_xml, BOM, get_domain, \
+    post_ratelimited
 from exchangelib.version import Build
+from exchangelib.winzone import generate_map, PYTZ_TO_MS_TIMEZONE_MAP
 
 if PY2:
     FileNotFoundError = OSError
+
+    from exchangelib.util import ConnectionResetError
 
 
 class BuildTest(unittest.TestCase):
@@ -113,9 +118,17 @@ class EWSDateTimeTest(unittest.TestCase):
             self.assertIsInstance(k, str)
             self.assertIsInstance(v, str)
 
-        # Test unknown timezone
+        # Test timezone unknown by pytz
         with self.assertRaises(UnknownTimeZone):
             EWSTimeZone.timezone('UNKNOWN')
+
+        # Test timezone known by pytz but with no Winzone mapping
+        import pytz
+        tz = pytz.timezone('Africa/Tripoli')
+        # This hack smashes the pytz timezone cache. Don't reuse the original timezone name for other tests
+        tz.zone = 'UNKNOWN'
+        with self.assertRaises(ValueError):
+            EWSTimeZone.from_pytz(tz)
 
     def test_ewsdatetime(self):
         tz = EWSTimeZone.timezone('Europe/Copenhagen')
@@ -143,6 +156,14 @@ class EWSDateTimeTest(unittest.TestCase):
         # Test error when tzinfo is set directly
         with self.assertRaises(ValueError):
             EWSDateTime(2000, 1, 1, tzinfo=tz)
+        # Test normalize, for completeness
+        self.assertEqual(tz.normalize(tz.localize(EWSDateTime(2000, 1, 1))).ewsformat(), '2000-01-01T00:00:00')
+
+    def test_generate(self):
+        self.assertDictEqual(generate_map(), PYTZ_TO_MS_TIMEZONE_MAP)
+
+    def test_ewsdate(self):
+        self.assertEqual(EWSDate(2000, 1, 1).ewsformat(), '2000-01-01')
 
 
 class RestrictionTest(unittest.TestCase):
@@ -613,6 +634,110 @@ class CommonTest(EWSTest):
                           username='foo',
                           password='bar')
 
+    def test_post_ratelimited(self):
+        url = 'https://example.com'
+
+        def mock_session_post(status_code, headers, text):
+            req = namedtuple('request', ['headers'])(headers={})
+            return lambda **kwargs: namedtuple(
+                'response', ['status_code', 'headers', 'text', 'request', 'history', 'url']
+            )(status_code=status_code, headers=headers, text=text, request=req, history=None, url=url)
+
+        def mock_session_exception(exc_cls):
+            def raise_exc(**kwargs):
+                raise exc_cls()
+            return raise_exc
+
+        protocol = self.config.protocol
+        # Make sure we fail fast in error cases
+        is_service_account = protocol.credentials.is_service_account
+        protocol.credentials.is_service_account = False
+
+        session = protocol.get_session()
+
+        # Test the straight, HTTP 200 path
+        session.post = mock_session_post(200, {}, 'foo')
+        r, session = post_ratelimited(protocol=protocol, session=session, url='', headers=None, data='')
+        self.assertEqual(r.text, 'foo')
+
+        # Test exceptions raises by the POST request
+        import requests.exceptions
+        from socket import timeout as SocketTimeout
+        for exc_cls in (requests.exceptions.ChunkedEncodingError, requests.exceptions.ConnectionError,
+                        ConnectionResetError, requests.exceptions.Timeout, SocketTimeout):
+            session.post = mock_session_exception(exc_cls)
+            with self.assertRaises(TransportError):
+                r, session = post_ratelimited(protocol=protocol, session=session, url='', headers=None, data='')
+
+        # Test bad exit codes and headers
+        session.post = mock_session_post(401, {}, '')
+        with self.assertRaises(TransportError):
+            r, session = post_ratelimited(protocol=protocol, session=session, url='', headers=None, data='')
+        session.post = mock_session_post(999, {'connection': 'close'}, '')
+        with self.assertRaises(TransportError):
+            r, session = post_ratelimited(protocol=protocol, session=session, url='', headers=None, data='')
+        session.post = mock_session_post(302, {'location': '/ews/genericerrorpage.htm?aspxerrorpath=/ews/exchange.asmx'}, '')
+        with self.assertRaises(TransportError):
+            r, session = post_ratelimited(protocol=protocol, session=session, url='', headers=None, data='')
+        session.post = mock_session_post(503, {}, '')
+        with self.assertRaises(TransportError):
+            r, session = post_ratelimited(protocol=protocol, session=session, url='', headers=None, data='')
+
+        # No redirect header
+        session.post = mock_session_post(302, {}, '')
+        with self.assertRaises(TransportError):
+            r, session = post_ratelimited(protocol=protocol, session=session, url=url, headers=None, data='')
+        # Redirect header to same location
+        session.post = mock_session_post(302, {'location': url}, '')
+        with self.assertRaises(TransportError):
+            r, session = post_ratelimited(protocol=protocol, session=session, url=url, headers=None, data='')
+        # Redirect header to relative location
+        session.post = mock_session_post(302, {'location': url + '/foo'}, '')
+        with self.assertRaises(RedirectError):
+            r, session = post_ratelimited(protocol=protocol, session=session, url=url, headers=None, data='')
+        # Redirect header to other location and allow_redirects=False
+        session.post = mock_session_post(302, {'location': 'https://contoso.com'}, '')
+        with self.assertRaises(TransportError):
+            r, session = post_ratelimited(protocol=protocol, session=session, url=url, headers=None, data='')
+        # Redirect header to other location and allow_redirects=True
+        import exchangelib.util
+        exchangelib.util.MAX_REDIRECTS = 0
+        session.post = mock_session_post(302, {'location': 'https://contoso.com'}, '')
+        with self.assertRaises(TransportError):
+            r, session = post_ratelimited(protocol=protocol, session=session, url=url, headers=None, data='',
+                                          allow_redirects=True)
+
+        # CAS error
+        session.post = mock_session_post(999, {'X-CasErrorCode': 'AAARGH!'}, '')
+        with self.assertRaises(CASError):
+            r, session = post_ratelimited(protocol=protocol, session=session, url=url, headers=None, data='')
+
+        # Allow XML data in a non-HTTP 200 response
+        session.post = mock_session_post(500, {}, '<?xml version="1.0" ?><foo></foo>')
+        r, session = post_ratelimited(protocol=protocol, session=session, url=url, headers=None, data='')
+        self.assertEqual(r.text, '<?xml version="1.0" ?><foo></foo>')
+
+        # Bad status_code and bad text
+        session.post = mock_session_post(999, {}, '')
+        with self.assertRaises(TransportError):
+            r, session = post_ratelimited(protocol=protocol, session=session, url=url, headers=None, data='')
+
+        # Rate limit exceeded. Only raised when is_service_account=True
+        exchangelib.util.MAX_WAIT = 1
+        protocol.credentials.is_service_account = True
+        session.post = mock_session_post(503, {'connection': 'close'}, '')
+        protocol.renew_session = lambda s: s  # Return the same session so it's still mocked
+        with self.assertRaises(RateLimitError):
+            r, session = post_ratelimited(protocol=protocol, session=session, url='', headers=None, data='')
+        # Test something larger than the default wait, so we retry at least once
+        exchangelib.util.MAX_WAIT = 15
+        session.post = mock_session_post(503, {'connection': 'close'}, '')
+        with self.assertRaises(RateLimitError):
+            r, session = post_ratelimited(protocol=protocol, session=session, url='', headers=None, data='')
+
+        protocol.release_session(session)
+        protocol.credentials.is_service_account = is_service_account
+
 
 class AccountTest(EWSTest):
     def test_magic(self):
@@ -1002,10 +1127,11 @@ class BaseItemTest(EWSTest):
 
     def test_error_policy(self):
         # Test the is_service_account flag. This is difficult to test thoroughly
+        is_service_account = self.account.protocol.credentials.is_service_account
         self.account.protocol.credentials.is_service_account = False
         item = self.get_test_item()
         self.test_folder.all()
-        self.account.protocol.credentials.is_service_account = True
+        self.account.protocol.credentials.is_service_account = is_service_account
 
     def test_queryset_copy(self):
         qs = QuerySet(self.test_folder)
@@ -2067,7 +2193,7 @@ class BaseItemTest(EWSTest):
     def test_register(self):
         # Tests that we can register and de-register custom extended properties
         class TestProp(ExtendedProperty):
-            property_id = 'deadbeaf-cafe-cafe-cafe-deadbeefcafe'
+            property_set_id = 'deadbeaf-cafe-cafe-cafe-deadbeefcafe'
             property_name = 'Test Property'
             property_type = 'Integer'
 

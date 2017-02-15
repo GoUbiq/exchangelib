@@ -20,7 +20,7 @@ from six import text_type, PY2
 
 from .credentials import Credentials
 from .errors import TransportError
-from .services import GetServerTimeZones, GetRoomLists, GetRooms, ResolveNames
+from .services import GetServerTimeZones, GetRoomLists, GetRooms
 from .transport import get_auth_instance, get_service_authtype, get_docs_authtype, test_credentials, AUTH_TYPE_MAP
 from .util import split_url
 from .version import Version, API_VERSIONS
@@ -34,12 +34,7 @@ log = logging.getLogger(__name__)
 
 
 def close_connections():
-    for key, protocol in CachingProtocol._protocol_cache.items():
-        service_endpoint, credentials, verify_ssl = key
-        log.debug("Service endpoint '%s': Closing sessions", service_endpoint)
-        protocol.close()
-        del protocol
-    CachingProtocol._protocol_cache.clear()
+    CachingProtocol.clear_cache()
 
 
 class BaseProtocol(object):
@@ -175,6 +170,15 @@ class CachingProtocol(type):
         log.debug('_protocol_cache_lock released')
         return protocol
 
+    @classmethod
+    def clear_cache(mcs):
+        for key, protocol in mcs._protocol_cache.items():
+            service_endpoint, credentials, verify_ssl = key
+            log.debug("Service endpoint '%s': Closing sessions", service_endpoint)
+            protocol.close()
+            del protocol
+        mcs._protocol_cache.clear()
+
 
 @python_2_unicode_compatible
 class Protocol(with_metaclass(CachingProtocol, BaseProtocol)):
@@ -189,7 +193,7 @@ class Protocol(with_metaclass(CachingProtocol, BaseProtocol)):
         # Autodetect authentication type if necessary
         if self.auth_type is None:
             self.auth_type = get_service_authtype(service_endpoint=self.service_endpoint, versions=API_VERSIONS,
-                                                  verify=self.verify_ssl)
+                                                  verify=self.verify_ssl, name=self.credentials.username)
         self.docs_auth_type = get_docs_authtype(verify=self.verify_ssl, docs_url=self.types_url)
 
         # Try to behave nicely with the Exchange server. We want to keep the connection open between requests.

@@ -2,6 +2,18 @@
 Change Log
 ==========
 
+HEAD
+----
+* Expanded support for `ExtendedPropery` to include all possible attributes. This required renaming the `property_id`
+* attribute to `property_set_id`.
+
+1.8.1
+-----
+* Fix completely botched `Message.from` field renaming in 1.8.0
+* Improve performance of QuerySet slicing and indexing. For example, `account.inbox.all()[10]` and
+  `account.inbox.all()[:10]` now only fetch 10 items from the server even though `account.inbox.all()` could contain
+  thousands of messages.
+
 1.8.0
 -----
 * Allow setting `Mailbox` and `Attendee`-type attributes as plain strings, e.g.:

@@ -14,7 +14,7 @@ from future.utils import PY2
 from future.utils import raise_from
 from six import text_type, string_types
 
-from .errors import TransportError, RateLimitError, RedirectError, RelativeRedirect
+from .errors import TransportError, RateLimitError, RedirectError, RelativeRedirect, CASError
 
 if PY2:
     from thread import get_ident
@@ -90,7 +90,7 @@ def get_xml_attr(tree, name):
     elem = tree.find(name)
     if elem is None:  # Must compare with None, see XML docs
         return None
-    return  elem.text or None
+    return elem.text or None
 
 
 def get_xml_attrs(tree, name):
@@ -126,6 +126,10 @@ def xml_text_to_value(value, field_type):
     from .folders import Choice, Email, AnyURI, Body, HTMLBody, MimeContent
     if field_type == string_type:
         # Return builtin str unprocessed
+        return value
+    if field_type == bytes:
+        # Return builtin bytes unprocessed. The XML returns binary data as plain strings, so we'll leave it to the
+        # caller to decide how to decode.
         return value
     if field_type in (Choice, Email, AnyURI, Body, HTMLBody, MimeContent):
         # Cast string-like values to their intended class
@@ -208,7 +212,7 @@ def to_xml(text, encoding):
                 offending_line = ''
             offending_excerpt = offending_line[max(0, col_no - 20):col_no + 20].decode('ascii', 'ignore')
             raise_from(ParseError('%s\nOffending text: [...]%s[...]' % (text_type(e), offending_excerpt)), e)
-        except  TypeError:
+        except TypeError:
             raise ParseError('This is not XML: %s' % text)
 
 
@@ -274,6 +278,10 @@ def get_redirect_url(response, allow_relative=True, require_relative=False):
     return redirect_url, redirect_server, redirect_has_ssl
 
 
+MAX_WAIT = 3600  # seconds
+MAX_REDIRECTS = 5  # Define a max redirection count. We don't want to be sent into an endless redirect loop
+
+
 def post_ratelimited(protocol, session, url, headers, data, timeout=None, verify=True, allow_redirects=False):
     """
     There are two error-handling policies implemented here: a fail-fast policy intended for stnad-alone scripts which
@@ -300,9 +308,7 @@ def post_ratelimited(protocol, session, url, headers, data, timeout=None, verify
     # intend to raise an exception. We give up on max_wait timeout, not number of retries
     r = None
     wait = 10  # seconds
-    max_wait = 3600  # seconds
     redirects = 0
-    max_redirects = 5  # We don't want to be sent into an endless redirect loop
     log_msg = '''\
 Retry: %(i)s
 Waited: %(wait)s
@@ -349,7 +355,7 @@ Response headers: %(response_headers)s'''
             # f*ckups on the Exchange server.
             if (r.status_code == 401) \
                     or (r.headers.get('connection') == 'close') \
-                    or (r.status_code == 302 and r.headers.get('location').lower() ==
+                    or (r.status_code == 302 and r.headers.get('location', '').lower() ==
                         '/ews/genericerrorpage.htm?aspxerrorpath=/ews/exchange.asmx') \
                     or (r.status_code == 503):
                 # Maybe stale session. Get brand new one. But wait a bit, since the server may be rate-limiting us.
@@ -360,8 +366,8 @@ Response headers: %(response_headers)s'''
                 if not protocol.credentials.is_service_account:
                     break
                 log_vals['i'] += 1
-                log_vals['wait'] = wait  # We set it to 0 initially
-                if wait > max_wait:
+                log_vals['wait'] = wait
+                if wait > MAX_WAIT:
                     # We lost patience. Session is cleaned up in outer loop
                     raise RateLimitError(
                         'Session %(session_id)s URL %(url)s: Max timeout reached' % log_vals)
@@ -386,7 +392,7 @@ Response headers: %(response_headers)s'''
                 log_vals['url'] = url
                 log.debug('302 Redirected to %s', url)
                 redirects += 1
-                if redirects > max_redirects:
+                if redirects > MAX_REDIRECTS:
                     raise TransportError('Max redirect count exceeded')
                 continue
             break
@@ -410,6 +416,9 @@ Response headers: %(response_headers)s'''
         protocol.retire_session(session)
         raise
     if r.status_code != 200:
+        cas_error = r.headers.get('X-CasErrorCode')
+        if cas_error:
+            raise CASError(cas_error=cas_error, response=r)
         if r.text and is_xml(r.text):
             # Some genius at Microsoft thinks it's OK to send 500 error messages with valid SOAP response
             log.debug('Got status code %s but trying to parse content anyway', r.status_code)
